@@ -1,0 +1,41 @@
+======================================================================
+基本规模
+======================================================================
+训练: 4940 (type=dict)
+测试: 1574 (type=list)
+
+训练 key 示例（前 3 个）:
+  key = ('midis/0_1.mid', 'midis/0_2.mid')
+  value = False
+  key = ('midis/1_1.mid', 'midis/1_2.mid')
+  value = False
+  key = ('midis/2_1.mid', 'midis/2_2.mid')
+  value = False
+
+测试 key 示例（前 3 个）:
+  item = ('midis/4940_1.mid', 'midis/4940_2.mid')
+  item = ('midis/4941_1.mid', 'midis/4941_2.mid')
+  item = ('midis/4942_1.mid', 'midis/4942_2.mid')
+
+标签分布:
+  False: 2470 (50.00%)
+  True: 2470 (50.00%)
+
+======================================================================
+采样一个文件看格式
+======================================================================
+key = ('midis/0_1.mid', 'midis/0_2.mid')
+key 类型: tuple
+value: False
+
+Path 1: midis/0_1.mid
+Path 2: midis/0_2.mid
+Path 1 exists: True
+Path 2 exists: True
+
+MIDI 1: instruments=1, n_notes(inst0)=16
+MIDI 2: instruments=1, n_notes(inst0)=18
+MIDI 1 时长: start=0, end=3839
+MIDI 2 时长: start=0, end=3598
+
+训练中涉及的不同 MIDI 文件数: 9880

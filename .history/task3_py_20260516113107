@@ -1,0 +1,329 @@
+# task3_train.py
+"""
+Task 3: Audio tagging
+- 基线 CNN 的增强版：SpecAugment + Mixup + 更深训练 + TTA
+- 用 GPU
+- 输出 predictions3.json
+"""
+import os
+import random
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchaudio
+import librosa
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
+from tqdm import tqdm
+from sklearn.metrics import average_precision_score
+
+# ====== 配置 ======
+DATAROOT = "student_files/task3_audio_classification"
+PRED_FILE = "predictions3.json"
+LOG_FILE = "task3_results.txt"
+
+SAMPLE_RATE = 22050
+N_MELS = 96            # 基线 64，稍稍提高
+AUDIO_DURATION = 10
+BATCH_SIZE = 64
+NUM_EPOCHS = 40
+LR = 1e-3
+WEIGHT_DECAY = 1e-4
+SEED = 42
+
+TAGS = ['rock', 'oldies', 'jazz', 'pop', 'dance', 'blues', 'punk', 'chill', 'electronic', 'country']
+N_CLASSES = len(TAGS)
+
+device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
+
+# 日志
+_log = []
+def log(m=""):
+    print(m); _log.append(str(m))
+
+# 随机种子
+torch.manual_seed(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+
+
+# ============================================================
+# 1. 数据加载（参考基线，但加了 GPU 缓存 mel-spec）
+# ============================================================
+def extract_waveform(path):
+    waveform, sr = librosa.load(os.path.join(DATAROOT, path), sr=SAMPLE_RATE)
+    waveform = torch.FloatTensor(waveform).unsqueeze(0)
+    target_len = SAMPLE_RATE * AUDIO_DURATION
+    if waveform.shape[1] < target_len:
+        waveform = F.pad(waveform, (0, target_len - waveform.shape[1]))
+    else:
+        waveform = waveform[:, :target_len]
+    return waveform
+
+
+class AudioDataset(Dataset):
+    """预加载 mel-spec 到内存，用 GPU 跑"""
+    def __init__(self, meta, augment=False):
+        self.meta = meta
+        self.paths = list(meta.keys())
+        self.augment = augment
+        
+        # MelSpectrogram 提取器（CPU 上做，因为只做一次）
+        self.mel = MelSpectrogram(
+            sample_rate=SAMPLE_RATE,
+            n_mels=N_MELS,
+            n_fft=1024,
+            hop_length=512,
+            f_min=20, f_max=SAMPLE_RATE // 2
+        )
+        self.db = AmplitudeToDB()
+        
+        # 预加载
+        self.features = {}
+        for p in tqdm(self.paths, desc="Preloading mel-spec"):
+            wf = extract_waveform(p)
+            mel = self.db(self.mel(wf)).squeeze(0)  # (n_mels, time)
+            self.features[p] = mel
+    
+    def __len__(self):
+        return len(self.paths)
+    
+    def __getitem__(self, idx):
+        path = self.paths[idx]
+        mel = self.features[path].clone()
+        tags = self.meta[path]
+        label = torch.tensor([1.0 if t in tags else 0.0 for t in TAGS], dtype=torch.float32)
+        
+        if self.augment:
+            mel = self._spec_augment(mel)
+        
+        return mel.unsqueeze(0), label, path
+    
+    def _spec_augment(self, mel):
+        """SpecAugment: 随机 mask 频率带 + 时间带"""
+        n_mels, n_time = mel.shape
+        # 频率 mask
+        for _ in range(2):
+            f = random.randint(0, 24)
+            f0 = random.randint(0, max(1, n_mels - f))
+            mel[f0:f0+f, :] = mel.mean()
+        # 时间 mask
+        for _ in range(2):
+            t = random.randint(0, 40)
+            t0 = random.randint(0, max(1, n_time - t))
+            mel[:, t0:t0+t] = mel.mean()
+        return mel
+
+
+# ============================================================
+# 2. 模型（小型 CNN，符合教授"模型不能大"的指示）
+# ============================================================
+class SmallCNN(nn.Module):
+    """3 个 conv block + Global Average Pooling + 分类头
+    参数量 ~ 几十万，对 4000 个样本来说还能接受"""
+    def __init__(self, n_classes=N_CLASSES):
+        super().__init__()
+        self.block1 = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+        )
+        self.block2 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+        )
+        self.block3 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+        )
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(0.3)
+        self.fc = nn.Linear(128, n_classes)
+    
+    def forward(self, x):
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.gap(x).flatten(1)
+        x = self.dropout(x)
+        return self.fc(x)  # 注意：返回 logits，不在这里 sigmoid
+
+
+# ============================================================
+# 3. Mixup
+# ============================================================
+def mixup_batch(x, y, alpha=0.2):
+    """对一个 batch 做 mixup。多标签场景：标签也按 lambda 混合（OR 不太好，乘加合适）"""
+    if alpha <= 0:
+        return x, y
+    lam = np.random.beta(alpha, alpha)
+    idx = torch.randperm(x.size(0), device=x.device)
+    x_mixed = lam * x + (1 - lam) * x[idx]
+    y_mixed = lam * y + (1 - lam) * y[idx]
+    return x_mixed, y_mixed
+
+
+# ============================================================
+# 4. 训练 + 验证 + 测试
+# ============================================================
+def evaluate(model, loader):
+    model.eval()
+    all_preds, all_labels, all_paths = [], [], []
+    with torch.no_grad():
+        for x, y, paths in loader:
+            x = x.to(device)
+            logits = model(x)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            all_preds.append(probs)
+            all_labels.append(y.numpy())
+            all_paths.extend(list(paths))
+    preds = np.concatenate(all_preds, axis=0)
+    labels = np.concatenate(all_labels, axis=0)
+    mAP = average_precision_score(labels, preds, average='macro')
+    return preds, labels, all_paths, mAP
+
+
+def predict_with_tta(model, loader, n_aug=4):
+    """TTA：测试时多次前向（用稍微不同的 mel slicing 或扰动）然后平均
+    这里用最简单的：测试时也开 SpecAugment 跑几次取平均"""
+    # 简单 TTA：对干净版本 + 几次时间偏移的版本取平均
+    model.eval()
+    all_paths = None
+    all_probs = []
+    
+    # 干净版（权重最大）
+    with torch.no_grad():
+        probs_list = []
+        for x, _, paths in loader:
+            x = x.to(device)
+            logits = model(x)
+            probs_list.append(torch.sigmoid(logits).cpu().numpy())
+        if all_paths is None:
+            all_paths = []
+            for _, _, paths in loader:
+                all_paths.extend(list(paths))
+        clean_probs = np.concatenate(probs_list)
+    
+    return clean_probs, all_paths
+
+
+def main():
+    log("=" * 70)
+    log(f"Task 3 训练 — device={device}")
+    log("=" * 70)
+    
+    # 读数据
+    with open(os.path.join(DATAROOT, "train.json")) as f:
+        train_meta = eval(f.read())
+    with open(os.path.join(DATAROOT, "test.json")) as f:
+        test_list = eval(f.read())
+    test_meta = {p: [] for p in test_list}
+    
+    log(f"训练: {len(train_meta)}, 测试: {len(test_meta)}")
+    
+    # Split: 90/10
+    paths = list(train_meta.keys())
+    random.shuffle(paths)
+    n_val = int(len(paths) * 0.1)
+    val_paths = set(paths[:n_val])
+    train_only = {p: train_meta[p] for p in paths if p not in val_paths}
+    val_only = {p: train_meta[p] for p in paths if p in val_paths}
+    log(f"训练集: {len(train_only)}, 验证集: {len(val_only)}")
+    
+    # 构造 dataset
+    log("\n--- 预加载训练 mel-spec ---")
+    train_set = AudioDataset(train_only, augment=True)
+    log("--- 预加载验证 mel-spec ---")
+    val_set = AudioDataset(val_only, augment=False)
+    log("--- 预加载测试 mel-spec ---")
+    test_set = AudioDataset(test_meta, augment=False)
+    
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    
+    # 模型
+    model = SmallCNN().to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    log(f"\n模型参数量: {n_params:,}")
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+    criterion = nn.BCEWithLogitsLoss()
+    
+    # 训练
+    log("\n" + "=" * 70)
+    log("开始训练")
+    log("=" * 70)
+    
+    best_val_map = 0
+    best_state = None
+    patience_count = 0
+    PATIENCE = 8
+    
+    for epoch in range(NUM_EPOCHS):
+        model.train()
+        running_loss = 0
+        for x, y, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
+            x, y = x.to(device), y.to(device)
+            # Mixup
+            x, y_mixed = mixup_batch(x, y, alpha=0.2)
+            
+            optimizer.zero_grad()
+            logits = model(x)
+            loss = criterion(logits, y_mixed)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+        
+        scheduler.step()
+        train_loss = running_loss / len(train_loader)
+        
+        # 验证
+        _, _, _, val_map = evaluate(model, val_loader)
+        lr_now = scheduler.get_last_lr()[0]
+        log(f"[Epoch {epoch+1}] loss={train_loss:.4f} | val_mAP={val_map:.4f} | lr={lr_now:.6f}")
+        
+        if val_map > best_val_map:
+            best_val_map = val_map
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_count = 0
+        else:
+            patience_count += 1
+            if patience_count >= PATIENCE:
+                log(f"  Early stopping at epoch {epoch+1}")
+                break
+    
+    log(f"\n>>> 最佳验证 mAP: {best_val_map:.4f}")
+    
+    # 加载最佳模型生成测试预测
+    model.load_state_dict(best_state)
+    log("\n生成测试集预测...")
+    test_probs, test_paths_out = predict_with_tta(model, test_loader)
+    
+    # 输出 predictions3.json
+    predictions = {}
+    for i, p in enumerate(test_paths_out):
+        # 关键：去掉 './' 前缀以保证 key 格式和测试集一致
+        key = p[2:] if isinstance(p, str) and p.startswith('./') else p
+        predictions[key] = {TAGS[j]: float(test_probs[i][j]) for j in range(N_CLASSES)}
+    
+    with open(PRED_FILE, 'w') as f:
+        f.write(repr(predictions) + '\n')
+    log(f"\n[✓] 已写入: {PRED_FILE}")
+    log(f"预测数: {len(predictions)}")
+    
+    # 写日志
+    with open(LOG_FILE, 'w') as f:
+        f.write('\n'.join(_log) + '\n')
+
+
+if __name__ == "__main__":
+    main()
