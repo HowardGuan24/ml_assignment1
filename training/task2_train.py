@@ -15,7 +15,6 @@ import miditoolkit
 import numpy as np
 from sklearn.ensemble import (
     ExtraTreesClassifier,
-    GradientBoostingClassifier,
     HistGradientBoostingClassifier,
     RandomForestClassifier,
     VotingClassifier,
@@ -31,12 +30,22 @@ from tqdm import tqdm
 DATAROOT = "student_files/task2_next_sequence_prediction"
 PRED_FILE = "results/predictions2.json"
 LOG_FILE = "train_log/task2_results_v3.txt"
+CACHE_FILE = "train_log/task2_features_v3.npz"
 
 BOUNDARY_WINDOWS = (1, 2, 4, 8, 12, 16)
 INTERVAL_MIN, INTERVAL_MAX = -12, 12
 N_INTERVALS = INTERVAL_MAX - INTERVAL_MIN + 1
 SEGMENT_FEATURE_DIM = 131
 BOUNDARY_FEATURE_DIM = 134
+
+N_JOBS = int(os.environ.get("TASK2_N_JOBS", "-1"))
+N_SPLITS = int(os.environ.get("TASK2_N_SPLITS", "5"))
+USE_XGBOOST = os.environ.get("TASK2_USE_XGBOOST", "1") != "0"
+USE_GPU = os.environ.get("TASK2_GPU", "0") == "1"
+INCLUDE_SLOW_GBM = os.environ.get("TASK2_INCLUDE_SLOW_GBM", "0") == "1"
+EVAL_ENSEMBLE = os.environ.get("TASK2_EVAL_ENSEMBLE", "0") == "1"
+USE_FEATURE_CACHE = os.environ.get("TASK2_FEATURE_CACHE", "1") != "0"
+FEATURE_VERSION = "task2_v3_windows_1_2_4_8_12_16_dim5589"
 
 _log = []
 
@@ -493,13 +502,72 @@ def extract_all_pairs(pairs, name="data", augment=False):
     return np.asarray(feats, dtype=np.float32), np.asarray(labels, dtype=np.int64), pair_list
 
 
+def load_feature_cache():
+    if not USE_FEATURE_CACHE or not os.path.exists(CACHE_FILE):
+        return None
+    try:
+        cached = np.load(CACHE_FILE, allow_pickle=False)
+        version = str(cached["feature_version"])
+        if version != FEATURE_VERSION:
+            log(f"Feature cache version mismatch, rebuilding: {version} != {FEATURE_VERSION}")
+            return None
+        log(f"Loaded feature cache: {CACHE_FILE}")
+        return cached["X_train"], cached["y_train"], cached["X_test"]
+    except Exception as exc:
+        log(f"Could not load feature cache, rebuilding: {type(exc).__name__}: {exc}")
+        return None
+
+
+def save_feature_cache(X_train, y_train, X_test):
+    if not USE_FEATURE_CACHE:
+        return
+    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+    np.savez_compressed(
+        CACHE_FILE,
+        feature_version=np.asarray(FEATURE_VERSION),
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+    )
+    log(f"Saved feature cache: {CACHE_FILE}")
+
+
+def make_xgboost_model():
+    try:
+        from xgboost import XGBClassifier
+    except Exception as exc:
+        log(f"XGBoost unavailable, skipping: {type(exc).__name__}: {exc}")
+        return None
+
+    params = dict(
+        n_estimators=650,
+        max_depth=4,
+        learning_rate=0.035,
+        subsample=0.9,
+        colsample_bytree=0.75,
+        reg_lambda=2.0,
+        reg_alpha=0.05,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        random_state=42,
+        n_jobs=N_JOBS,
+    )
+    if USE_GPU:
+        # XGBoost >= 2 prefers device="cuda"; older versions use tree_method="gpu_hist".
+        params.update(tree_method="hist", device="cuda")
+    else:
+        params.update(tree_method="hist")
+
+    return XGBClassifier(**params)
+
+
 def make_models():
-    return [
+    models = [
         (
             "LR",
             lambda: make_pipeline(
                 StandardScaler(),
-                LogisticRegression(max_iter=5000, C=0.75, n_jobs=-1),
+                LogisticRegression(max_iter=5000, C=0.75, n_jobs=N_JOBS),
             ),
         ),
         (
@@ -509,7 +577,7 @@ def make_models():
                 max_features="sqrt",
                 min_samples_leaf=2,
                 random_state=42,
-                n_jobs=-1,
+                n_jobs=N_JOBS,
             ),
         ),
         (
@@ -520,7 +588,7 @@ def make_models():
                 min_samples_leaf=2,
                 class_weight=None,
                 random_state=42,
-                n_jobs=-1,
+                n_jobs=N_JOBS,
             ),
         ),
         (
@@ -533,27 +601,39 @@ def make_models():
                 random_state=42,
             ),
         ),
-        (
-            "GBM",
-            lambda: GradientBoostingClassifier(
-                n_estimators=450,
-                learning_rate=0.045,
-                max_depth=3,
-                subsample=0.85,
-                random_state=42,
-            ),
-        ),
     ]
+
+    if USE_XGBOOST:
+        probe = make_xgboost_model()
+        if probe is not None:
+            models.append(("XGBoostGPU" if USE_GPU else "XGBoost", make_xgboost_model))
+
+    if INCLUDE_SLOW_GBM:
+        from sklearn.ensemble import GradientBoostingClassifier
+
+        models.append(
+            (
+                "SlowGBM",
+                lambda: GradientBoostingClassifier(
+                    n_estimators=250,
+                    learning_rate=0.05,
+                    max_depth=3,
+                    subsample=0.85,
+                    random_state=42,
+                ),
+            )
+        )
+
+    return models
 
 
 def make_soft_vote():
-    return VotingClassifier(
-        estimators=[
+    estimators = [
             (
                 "lr",
                 make_pipeline(
                     StandardScaler(),
-                    LogisticRegression(max_iter=5000, C=0.75, n_jobs=-1),
+                    LogisticRegression(max_iter=5000, C=0.75, n_jobs=N_JOBS),
                 ),
             ),
             (
@@ -563,7 +643,7 @@ def make_soft_vote():
                     max_features="sqrt",
                     min_samples_leaf=2,
                     random_state=42,
-                    n_jobs=-1,
+                    n_jobs=N_JOBS,
                 ),
             ),
             (
@@ -576,19 +656,19 @@ def make_soft_vote():
                     random_state=42,
                 ),
             ),
-            (
-                "gbm",
-                GradientBoostingClassifier(
-                    n_estimators=400,
-                    learning_rate=0.045,
-                    max_depth=3,
-                    subsample=0.85,
-                    random_state=42,
-                ),
-            ),
-        ],
+    ]
+    weights = [1, 2, 2]
+
+    if USE_XGBOOST:
+        xgb = make_xgboost_model()
+        if xgb is not None:
+            estimators.append(("xgb", xgb))
+            weights.append(2)
+
+    return VotingClassifier(
+        estimators=estimators,
         voting="soft",
-        weights=[1, 2, 2, 2],
+        weights=weights,
         n_jobs=None,
     )
 
@@ -634,31 +714,48 @@ def main():
 
     log(f"Train pairs: {len(train_pairs)}, test pairs: {len(test_pairs)}")
     log(f"Boundary windows: {BOUNDARY_WINDOWS}")
+    log(
+        "Runtime config: "
+        f"N_JOBS={N_JOBS}, N_SPLITS={N_SPLITS}, USE_XGBOOST={USE_XGBOOST}, "
+        f"USE_GPU={USE_GPU}, INCLUDE_SLOW_GBM={INCLUDE_SLOW_GBM}, "
+        f"EVAL_ENSEMBLE={EVAL_ENSEMBLE}, USE_FEATURE_CACHE={USE_FEATURE_CACHE}"
+    )
 
-    log("\n--- Feature extraction: train with symmetric augmentation ---")
-    X_train, y_train, _ = extract_all_pairs(train_pairs, "train", augment=True)
-    log(f"X_train: {X_train.shape}, y_train: {y_train.shape}")
-    log(f"True ratio: {float(np.mean(y_train)):.4f}")
+    cached = load_feature_cache()
+    if cached is None:
+        log("\n--- Feature extraction: train with symmetric augmentation ---")
+        X_train, y_train, _ = extract_all_pairs(train_pairs, "train", augment=True)
+        log(f"X_train: {X_train.shape}, y_train: {y_train.shape}")
+        log(f"True ratio: {float(np.mean(y_train)):.4f}")
 
-    log("\n--- Feature extraction: test ---")
-    test_pairs_dummy = [(p1, p2, 0) for p1, p2 in test_pairs]
-    X_test, _, _ = extract_all_pairs(test_pairs_dummy, "test", augment=False)
-    log(f"X_test: {X_test.shape}")
-    log(f"MIDI cache size: {len(_event_cache)}")
+        log("\n--- Feature extraction: test ---")
+        test_pairs_dummy = [(p1, p2, 0) for p1, p2 in test_pairs]
+        X_test, _, _ = extract_all_pairs(test_pairs_dummy, "test", augment=False)
+        log(f"X_test: {X_test.shape}")
+        log(f"MIDI cache size: {len(_event_cache)}")
+        save_feature_cache(X_train, y_train, X_test)
+    else:
+        X_train, y_train, X_test = cached
+        log(f"X_train: {X_train.shape}, y_train: {y_train.shape}")
+        log(f"X_test: {X_test.shape}")
+        log(f"True ratio: {float(np.mean(y_train)):.4f}")
 
     candidates = []
     for name, model_fn in make_models():
         log("\n" + "=" * 72)
         log(name)
         log("=" * 72)
-        mean, std = cv_evaluate(X_train, y_train, model_fn)
+        mean, std = cv_evaluate(X_train, y_train, model_fn, n_splits=N_SPLITS)
         candidates.append((name, mean, std, model_fn))
 
-    log("\n" + "=" * 72)
-    log("SoftVote")
-    log("=" * 72)
-    vote_mean, vote_std = cv_evaluate(X_train, y_train, make_soft_vote)
-    candidates.append(("SoftVote", vote_mean, vote_std, make_soft_vote))
+    if EVAL_ENSEMBLE:
+        log("\n" + "=" * 72)
+        log("SoftVote")
+        log("=" * 72)
+        vote_mean, vote_std = cv_evaluate(
+            X_train, y_train, make_soft_vote, n_splits=N_SPLITS
+        )
+        candidates.append(("SoftVote", vote_mean, vote_std, make_soft_vote))
 
     best_name, best_mean, best_std, best_fn = max(candidates, key=lambda x: x[1])
     log("\n" + "=" * 72)
