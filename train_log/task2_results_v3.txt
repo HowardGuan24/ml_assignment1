@@ -1,0 +1,75 @@
+========================================================================
+Task 2 v3: richer boundary continuity + sklearn model search
+========================================================================
+Train pairs: 4940, test pairs: 1574
+Boundary windows: (1, 2, 4, 8, 12, 16)
+Runtime config: N_JOBS=32, N_SPLITS=5, USE_XGBOOST=True, USE_GPU=False, INCLUDE_SLOW_GBM=False, EVAL_ENSEMBLE=False, USE_FEATURE_CACHE=True
+
+--- Feature extraction: train with symmetric augmentation ---
+X_train: (9880, 5589), y_train: (9880,)
+True ratio: 0.5000
+
+--- Feature extraction: test ---
+X_test: (1574, 5589)
+MIDI cache size: 13028
+Saved feature cache: train_log/task2_features_v3.npz
+XGBoost unavailable, skipping: ModuleNotFoundError: No module named 'xgboost'
+
+========================================================================
+LR
+========================================================================
+  Fold 1: acc = 0.8370, pred_true = 0.5081
+  Fold 2: acc = 0.8467, pred_true = 0.5096
+  Fold 3: acc = 0.8330, pred_true = 0.4808
+  Fold 4: acc = 0.8451, pred_true = 0.5020
+  Fold 5: acc = 0.8543, pred_true = 0.4929
+  Mean +/- Std: 0.8432 +/- 0.0075
+  CV pred True ratio: 0.4987
+
+========================================================================
+RF
+========================================================================
+  Fold 1: acc = 0.9013, pred_true = 0.5137
+  Fold 2: acc = 0.9054, pred_true = 0.4965
+  Fold 3: acc = 0.8957, pred_true = 0.4990
+  Fold 4: acc = 0.9074, pred_true = 0.4914
+  Fold 5: acc = 0.9069, pred_true = 0.5020
+  Mean +/- Std: 0.9033 +/- 0.0044
+  CV pred True ratio: 0.5005
+
+========================================================================
+ExtraTrees
+========================================================================
+  Fold 1: acc = 0.8770, pred_true = 0.5167
+  Fold 2: acc = 0.8770, pred_true = 0.4975
+  Fold 3: acc = 0.8654, pred_true = 0.5061
+  Fold 4: acc = 0.8725, pred_true = 0.4858
+  Fold 5: acc = 0.8740, pred_true = 0.4995
+  Mean +/- Std: 0.8732 +/- 0.0043
+  CV pred True ratio: 0.5011
+
+========================================================================
+HistGB
+========================================================================
+  Fold 1: acc = 0.9322, pred_true = 0.5081
+  Fold 2: acc = 0.9418, pred_true = 0.4924
+  Fold 3: acc = 0.9332, pred_true = 0.4960
+  Fold 4: acc = 0.9367, pred_true = 0.5025
+  Fold 5: acc = 0.9438, pred_true = 0.5056
+  Mean +/- Std: 0.9376 +/- 0.0046
+  CV pred True ratio: 0.5009
+
+========================================================================
+Model ranking
+========================================================================
+HistGB       mean=0.9376 std=0.0046
+RF           mean=0.9033 std=0.0044
+ExtraTrees   mean=0.8732 std=0.0043
+LR           mean=0.8432 std=0.0075
+
+>>> Best model: HistGB (CV acc = 0.9376 +/- 0.0046)
+Retraining HistGB on all augmented training data...
+
+[OK] Wrote results/predictions2.json
+Prediction count: 1574
+Prediction True ratio: 0.4981
